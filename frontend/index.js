@@ -7,6 +7,7 @@ let recordedBlob = null;
 let currentSubject = null;
 let isSpeaking = false;
 let currentAudio = null;
+let sessionId = null;
 
 // DOM Elements
 const welcomeState = document.getElementById("welcomeState");
@@ -44,11 +45,16 @@ const iconMap = {
     "CSS": "fab fa-css3-alt text-blue-400"
 };
 
+// Utilities
+function generateSessionId() {
+    return 'session_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+}
 
 // ========== UI STATE FUNCTIONS ==========
 
 function showInterviewPanel(subject) {
     currentSubject = subject;
+    sessionId = generateSessionId(); // Generate new session ID for each new interview
     
     subjectBtns.forEach((btn) => {
         btn.classList.toggle("active", btn.dataset.subject === subject);
@@ -121,6 +127,7 @@ function displayFeedback(data) {
 
 function resetToWelcome() {
     currentSubject = null;
+    sessionId = null;
     isSpeaking = false;
     mediaRecorder = null;
     recordingChunks = [];
@@ -163,7 +170,6 @@ function handleAudioStream(response, onComplete) {
     let queue = [];
     let isSourceBufferReady = false;
 
-    // Only show speaking bubble when actually streaming audio
     speakingBubble.classList.remove("hidden");
     isSpeaking = true;
     recordBtn.disabled = true;
@@ -190,7 +196,6 @@ function handleAudioStream(response, onComplete) {
     });
 
     function processChunk({ done, value }) {
-        console.log("Processing chunk:", value, done);
         if (done) {
             if (mediaSource.readyState === "open") {
                 try {
@@ -295,7 +300,6 @@ function stopRecording() {
 
 const startInterviewApiUrl = "/api/start-interview";
 
-
 async function startInterview() {
     startInterviewBtn.classList.add("hidden");
     recordBtn.classList.remove("hidden");
@@ -305,7 +309,10 @@ async function startInterview() {
         const response = await fetch(startInterviewApiUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ subject: currentSubject })
+            body: JSON.stringify({ 
+                subject: currentSubject,
+                session_id: sessionId
+            })
         });
         
         const contentType = response.headers.get("content-type");
@@ -316,7 +323,6 @@ async function startInterview() {
             });
         } else {
             const data = await response.json();
-            console.log("Question:", data.question);
             enableRecording();
             endInterviewBtn.disabled = false;
         }
@@ -330,7 +336,6 @@ async function startInterview() {
 
 const submitAnswerApiUrl = "/api/submit-answer";
 
-
 async function submitAnswer() {
     if (!recordedBlob) return;
 
@@ -339,6 +344,7 @@ async function submitAnswer() {
 
     const formData = new FormData();
     formData.append("audio", recordedBlob, "answer.webm");
+    formData.append("session_id", sessionId);
 
     try {
         const response = await fetch(submitAnswerApiUrl, {
@@ -371,7 +377,6 @@ async function submitAnswer() {
             });
         } else {
             const data = await response.json();
-            console.log("Response:", data);
             recordedBlob = null;
             recordingChunks = [];
             
@@ -388,8 +393,6 @@ async function submitAnswer() {
         enableRecording();
     }
 }
-
-
 
 async function endInterview() {
     if (!confirm("End interview and get feedback?")) return;
@@ -412,7 +415,7 @@ async function getFeedback() {
         const response = await fetch(getFeedbackApiUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({})
+            body: JSON.stringify({ session_id: sessionId })
         });
         
         const data = await response.json();

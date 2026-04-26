@@ -8,3 +8,5 @@ requests
 langchain-google-genai
 langchain-community
 gunicorn
+pytest
+langgraph-checkpoint-redis

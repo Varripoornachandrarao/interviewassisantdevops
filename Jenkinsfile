@@ -17,10 +17,10 @@ pipeline {
             }
         }
 
-        stage('Lint & Test') {
+        stage('Test') {
             steps {
-                echo 'Running Linting...'
-                // sh 'pylint backend/*.py'
+                echo 'Running Unit Tests...'
+                sh 'make test'
             }
         }
 
@@ -61,9 +61,12 @@ pipeline {
         stage('Kubernetes Deploy') {
             steps {
                 withKubeConfig([credentialsId: K8S_CREDENTIALS_ID]) {
-                    sh "sed -i 's|IMAGE_TAG|${BUILD_NUMBER}|g' k8s/backend-deployment.yaml"
-                    sh "sed -i 's|IMAGE_TAG|${BUILD_NUMBER}|g' k8s/frontend-deployment.yaml"
-                    sh "kubectl apply -f k8s/"
+                    echo 'Deploying with Helm...'
+                    sh """
+                    helm upgrade --install interview-assistant ./helm/interview-assistant \
+                        --set image.tag=${BUILD_NUMBER} \
+                        --set image.repository=${DOCKER_HUB_USER}/${IMAGE_NAME_BACKEND}
+                    """
                 }
             }
         }

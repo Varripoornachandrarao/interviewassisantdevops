@@ -1,0 +1,47 @@
+{{- if .Values.redis.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "interview-assistant.fullname" . }}-redis
+  labels:
+    {{- include "interview-assistant.labels" . | nindent 4 }}
+    component: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "interview-assistant.selectorLabels" . | nindent 6 }}
+      component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "interview-assistant.selectorLabels" . | nindent 8 }}
+        component: redis
+    spec:
+      containers:
+      - name: redis
+        image: {{ .Values.redis.image }}
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "interview-assistant.fullname" . }}-redis
+spec:
+  selector:
+    {{- include "interview-assistant.selectorLabels" . | nindent 4 }}
+    component: redis
+  ports:
+  - protocol: TCP
+    port: 6379
+    targetPort: 6379
+  type: ClusterIP
+{{- end }}

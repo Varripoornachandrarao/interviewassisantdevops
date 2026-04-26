@@ -1,48 +1,55 @@
-from flask import Flask,request,jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain.agents import create_agent
+try:
+    from langgraph_checkpoint_redis import RedisSaver
+    HAS_REDIS = True
+except ImportError:
+    HAS_REDIS = False
+from langgraph.prebuilt import create_react_agent
 import assemblyai as aai
 import os
 import base64
 import requests
 import tempfile
 import json
+import logging
+import redis
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MURF_API_KEY = os.getenv("MURF_API_KEY")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
+
 aai.settings.api_key = ASSEMBLYAI_API_KEY
-checkpointer = InMemorySaver()
 
-model = init_chat_model(
-    "google_genai:gemini-2.5-flash",
-    api_key=GOOGLE_API_KEY
+# Initialize checkpointer (Redis for prod/scaling, InMemory for dev)
+if HAS_REDIS and REDIS_URL:
+    try:
+        # Assuming REDIS_URL is like redis://host:port
+        checkpointer = RedisSaver.from_conn_info(host=REDIS_URL.split("//")[1].split(":")[0], port=int(REDIS_URL.split(":")[2]))
+        logger.info(f"Using RedisSaver for state persistence at {REDIS_URL}")
+    except Exception as e:
+        logger.warning(f"Failed to connect to Redis, falling back to InMemorySaver: {e}")
+        checkpointer = InMemorySaver()
+else:
+    logger.info("Using InMemorySaver for state persistence")
+    checkpointer = InMemorySaver()
+
+model = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash",
+    google_api_key=GOOGLE_API_KEY
 )
 
-agent = create_agent(
-    model=model,
-    tools=[],
-    checkpointer=checkpointer
-)
-
-checkpointer = ""
-
-model = init_chat_model(
-    "google_genai:gemini-2.5-flash",
-    api_key=GOOGLE_API_KEY
-)
-
-agent = ""
-
-question_count = 0
-current_subject = ""
-thread_id = "interview_session"
-
+# Shared interview prompts
 INTERVIEW_PROMPT = """You are Natalie, a friendly and conversational interviewer conducting a natural {subject} interview.
 
 IMPORTANT GUIDELINES:
@@ -69,10 +76,21 @@ FEEDBACK_PROMPT = """Based on our complete interview conversation, provide detai
     }}
     Be specific - reference ACTUAL things they said during the interview."""
 
-
 app = Flask(__name__)
 CORS(app, expose_headers=['X-Question-Number', 'X-Interview-Complete'])
 
+# Session state (simple in-memory dict for demo, should be more robust in prod)
+session_data = {}
+
+def get_agent(subject=None):
+    # If a subject is provided, we use it to format the system prompt
+    state_modifier = INTERVIEW_PROMPT.format(subject=subject) if subject else None
+    return create_react_agent(
+        model=model,
+        tools=[],
+        checkpointer=checkpointer,
+        state_modifier=state_modifier
+    )
 
 def stream_audio(text):
     BASE_URL = "https://global.api.murf.ai/v1/speech/stream"
@@ -89,60 +107,78 @@ def stream_audio(text):
         "Content-Type": "application/json",
         "api-key": MURF_API_KEY
     }
-    response = requests.post(
-        BASE_URL,
-        headers=headers,
-        data=json.dumps(payload),
-        stream=True
-    )
-    for chunk in response.iter_content(chunk_size=4096):
-        if chunk:
-            yield base64.b64encode(chunk).decode("utf-8") + "\n"
-
-
+    
+    try:
+        response = requests.post(
+            BASE_URL,
+            headers=headers,
+            data=json.dumps(payload),
+            stream=True
+        )
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=4096):
+            if chunk:
+                yield base64.b64encode(chunk).decode("utf-8") + "\n"
+    except Exception as e:
+        logger.error(f"Error streaming audio from Murf API: {e}")
+        yield ""
 
 @app.route("/start-interview", methods=["POST"])
 def start_interview():
-    global question_count, current_subject, checkpointer, agent
     data = request.json
-    current_subject = data.get("subject", "Python")
-    question_count = 1
-    checkpointer = InMemorySaver()
-    agent = create_agent(
-        model=model,
-        tools=[],
-        checkpointer=checkpointer
-    )
+    subject = data.get("subject", "Python")
+    
+    # We use a default thread_id for now, but this could be passed from the client
+    thread_id = data.get("session_id", "default_session")
+    
+    session_data[thread_id] = {
+        "question_count": 1,
+        "subject": subject
+    }
+    
+    agent = get_agent(subject)
     config = {"configurable": {"thread_id": thread_id}}
-    formatted_prompt = INTERVIEW_PROMPT.format(subject=current_subject)
-    response = agent.invoke({
-        "messages": [
-            {"role": "system", "content": formatted_prompt},
-            {"role": "user", "content": f"Start the interview with a warm greeting and ask the first question about {current_subject}. Keep it SHORT (1-2 sentences)."}
-        ]
-    }, config=config)
-    question = response["messages"][-1].content
-    print(f"\n[Question {question_count}] {question}")
-    return stream_audio(question), {"Content-Type": "text/plain"}
+    
+    try:
+        # For LangGraph create_react_agent, we just pass the user message
+        response = agent.invoke({
+            "messages": [
+                {"role": "user", "content": f"Start the interview with a warm greeting and ask the first question about {subject}. Keep it SHORT (1-2 sentences)."}
+            ]
+        }, config=config)
+        
+        question = response["messages"][-1].content
+        logger.info(f"[Session: {thread_id}] Started interview about {subject}")
+        
+        return Response(stream_audio(question), mimetype='text/plain')
+    except Exception as e:
+        logger.error(f"Error starting interview: {e}")
+        return jsonify({"error": str(e)}), 500
 
 def speech_to_text(audio_path):
-  """Convert audio file to text using AssemblyAI"""
-  transcriber = aai.Transcriber()
-  config = aai.TranscriptionConfig(
-        speech_models=["universal-3-pro", "universal-2"],
-        language_detection=True, speaker_labels=True,
-    )
-  transcript = transcriber.transcribe(audio_path, config=config)
-  return transcript.text if transcript.text else ""
-
-
+    """Convert audio file to text using AssemblyAI"""
+    try:
+        transcriber = aai.Transcriber()
+        config = aai.TranscriptionConfig(
+            speech_models=["universal-3-pro", "universal-2"],
+            language_detection=True
+        )
+        transcript = transcriber.transcribe(audio_path, config=config)
+        return transcript.text if transcript and transcript.text else ""
+    except Exception as e:
+        logger.error(f"Speech-to-text error: {e}")
+        return ""
 
 @app.route("/submit-answer", methods=["POST"])
 def submit_answer():
-    """Process user's answer and generate next question"""
-    global question_count
+    thread_id = request.form.get("session_id", "default_session")
     
-    audio_file = request.files["audio"]
+    if thread_id not in session_data:
+        return jsonify({"error": "Session not found. Please start a new interview."}), 400
+    
+    audio_file = request.files.get("audio")
+    if not audio_file:
+        return jsonify({"error": "No audio file provided"}), 400
     
     temp_path = tempfile.NamedTemporaryFile(delete=False, suffix=".webm").name
     audio_file.save(temp_path)
@@ -151,21 +187,24 @@ def submit_answer():
     os.unlink(temp_path)
     
     if not answer or answer.strip() == "":
-        answer = "[Candidate provided a verbal response]"
+        answer = "[Candidate provided a verbal response but transcription failed]"
     
-    print(f"[Answer {question_count}] {answer}")
+    logger.info(f"[Session: {thread_id}] Answer: {answer}")
     
     config = {"configurable": {"thread_id": thread_id}}
+    agent = get_agent(session_data[thread_id]["subject"])
     
     agent.invoke({"messages": [{"role": "user", "content": answer}]}, config=config)
     
-    if question_count >= 5:
+    current_count = session_data[thread_id]["question_count"]
+    
+    if current_count >= 5:
         response = agent.invoke({
             "messages": [{"role": "user", "content": "That was the 5th question. Briefly acknowledge their ACTUAL answer and let them know the interview is complete. Keep it SHORT."}]
         }, config=config)
         
         closing_message = response["messages"][-1].content
-        print(f"\n[Closing] {closing_message}")
+        logger.info(f"[Session: {thread_id}] Interview complete")
         
         return Response(
             stream_audio(closing_message),
@@ -173,59 +212,64 @@ def submit_answer():
             headers={'X-Interview-Complete': 'true'}
         )
     
-    question_count += 1
+    session_data[thread_id]["question_count"] += 1
+    new_count = session_data[thread_id]["question_count"]
     
-    prompt = f"""The candidate just answered question {question_count - 1}.
-
-Look at their ACTUAL answer above. Do NOT assume or make up what they said.
-
-Now ask question {question_count} of 5:
-1. Briefly acknowledge what they ACTUALLY said (1 sentence) - quote their exact words if needed
-2. Ask your next question that builds on their REAL response (1-2 sentences)
-3. If they said "I don't know" or gave a wrong answer, acknowledge that and ask something simpler
-4. Keep the TOTAL response under 3 sentences
-
-Be conversational but CONCISE. Only reference what they truly said."""
+    prompt = f"""The candidate just answered question {new_count - 1}.
+Look at their ACTUAL answer above. Now ask question {new_count} of 5:
+1. Briefly acknowledge what they ACTUALLY said (1 sentence)
+2. Ask your next question that builds on their response (1-2 sentences)
+3. Keep the TOTAL response under 3 sentences."""
     
     response = agent.invoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    
     question = response["messages"][-1].content
-    print(f"\n[Question {question_count}] {question}")
     
     return Response(
         stream_audio(question),
         mimetype='text/plain',
-        headers={'X-Question-Number': str(question_count)}
+        headers={'X-Question-Number': str(new_count)}
     )
-
 
 @app.route("/get-feedback", methods=["POST"])
 def get_feedback():
-    """Generate detailed interview feedback"""
+    data = request.json
+    thread_id = data.get("session_id", "default_session")
+    
+    if thread_id not in session_data:
+        return jsonify({"error": "Session not found"}), 400
+        
     config = {"configurable": {"thread_id": thread_id}}
-    response = agent.invoke({
-        "messages": [
-        {
-            "role": "user", 
-            "content": f"{FEEDBACK_PROMPT}\n\nReview our complete {current_subject} interview conversation and provide detailed feedback."
-        }
-        ]
-    }, config=config)
-    text = response["messages"][-1].content
-    print(f"\n[Feedback Generated]\n{text}\n")
-    cleaned = text.strip()
-    if "```" in cleaned:
-        cleaned = cleaned.split("```")[1].replace("json", "").strip()
-    feedback = json.loads(cleaned)
-
-    return jsonify({"success": True, "feedback": feedback})
-
+    agent = get_agent(session_data[thread_id]["subject"])
+    
+    try:
+        response = agent.invoke({
+            "messages": [
+                {"role": "user", "content": f"{FEEDBACK_PROMPT}\n\nReview our complete interview conversation and provide detailed feedback."}
+            ]
+        }, config=config)
+        
+        text = response["messages"][-1].content
+        cleaned = text.strip()
+        if "```" in cleaned:
+            # Handle cases where LLM might output code blocks or not
+            parts = cleaned.split("```")
+            if len(parts) >= 2:
+                cleaned = parts[1].replace("json", "").strip()
+        
+        try:
+            feedback = json.loads(cleaned)
+        except json.JSONDecodeError:
+            # Fallback if LLM output is not clean JSON
+            feedback = {"raw_text": cleaned}
+            
+        return jsonify({"success": True, "feedback": feedback})
+    except Exception as e:
+        logger.error(f"Error generating feedback: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Health check endpoint for monitoring"""
-    return jsonify({"status": "healthy", "version": "1.0.0"}), 200
-
+    return jsonify({"status": "healthy", "version": "1.2.0"}), 200
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
