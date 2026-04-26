@@ -1,0 +1,41 @@
+services:
+  backend:
+    image: ${DOCKERHUB_USERNAME}/interview-backend:latest
+    env_file:
+      - ./backend/.env
+    environment:
+      - FLASK_ENV=production
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    networks:
+      - interview-network
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - interview-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - interview-network
+
+  frontend:
+    image: ${DOCKERHUB_USERNAME}/interview-frontend:latest
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - interview-network
+
+networks:
+  interview-network:
+    driver: bridge
