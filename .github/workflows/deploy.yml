@@ -82,9 +82,18 @@ jobs:
             fi
 
             cd ~/interview-app
+            
+            # Ensure backend directory exists for the .env file
+            mkdir -p backend
+            
+            # Create a dummy .env if it doesn't exist so Docker doesn't crash
+            if [ ! -f backend/.env ]; then
+              touch backend/.env
+            fi
+
             export DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
             mv docker-compose.prod.yml docker-compose.yml || true
             
-            # Start the application
-            sudo docker compose pull
-            sudo docker compose up -d
+            # Start the application (using sudo -E to keep the variables)
+            sudo -E docker compose pull
+            sudo -E docker compose up -d
