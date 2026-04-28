@@ -94,6 +94,13 @@ jobs:
             export DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
             mv docker-compose.prod.yml docker-compose.yml || true
             
-            # Start the application (using sudo -E to keep the variables)
-            sudo -E docker compose pull
-            sudo -E docker compose up -d
+            # Hardcode the username into the file so there is no environment variable issue
+            sed -i "s/\${DOCKERHUB_USERNAME}/$DOCKERHUB_USERNAME/g" docker-compose.yml
+            
+            # Start the application
+            sudo docker compose pull
+            sudo docker compose up -d
+            
+            # Final check - show us what is running!
+            echo "Current Container Status:"
+            sudo docker ps
